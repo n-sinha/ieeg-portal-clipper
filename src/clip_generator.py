@@ -6,6 +6,8 @@ from pathlib import Path
 import h5py
 from IPython import embed
 from loguru import logger
+import mne
+import edfio
 
 # %%
 class ClipGenerator(IEEGmetadataValidated):
@@ -76,6 +78,7 @@ class ClipGenerator(IEEGmetadataValidated):
         clip['annotators'] = ''
         clip['layers'] = ''
         clip['close_to_event'] = False
+        
         clip_clean = self._check_clip_overlaps(clip, annotations, hours_window=2)
 
         # Apply conditions again
@@ -137,7 +140,7 @@ class ClipGenerator(IEEGmetadataValidated):
             # Remove the final formatting line since 'timestamp' is not a datetime column
             interictal_clips = interictal_clips.drop(columns=['day_label', 'time'])
 
-            self._get_interictal_clips(interictal_clips, clip_path.parent)    
+            self._get_interictal_clips_edf(interictal_clips, clip_path.parent)    
 
         return interictal_clips
         
@@ -174,13 +177,158 @@ class ClipGenerator(IEEGmetadataValidated):
                     ieeg_dataset.attrs['channels_labels'] = channel_labels
                     ieeg_dataset.attrs['sampling_rate'] = sampling_rate
 
+    def _save_as_edf(self, ieeg_clip: pd.DataFrame, sampling_rate: float, 
+                     channel_labels: list, output_path: Path, 
+                     clip_metadata: dict, day_num: int = None) -> None:
+        """
+        Convert pandas DataFrame to EDF format and save using edfio.
+        
+        Args:
+            ieeg_clip (pd.DataFrame): EEG data with channels as columns
+            sampling_rate (float): Sampling rate in Hz
+            channel_labels (list): List of channel names
+            output_path (Path): Path where EDF file will be saved
+            clip_metadata (dict): Metadata about the clip (timestamp, start_time_usec, etc.)
+        """
+        # Convert DataFrame to numpy array (channels as columns, samples as rows)
+        data = ieeg_clip.values.T  # Transpose to get channels x samples
+        
+        # Ensure data is in the correct format (float64 for edfio)
+        data = data.astype(np.float64)
+        
+        # Create EdfSignal objects for each channel
+        signals = []
+        for i, ch_name in enumerate(channel_labels):
+            # EDF channel names must be <= 16 characters
+            ch_name_short = ch_name[:16] if len(ch_name) > 16 else ch_name
+            
+            # Calculate physical range for this channel
+            physical_min = float(data[i].min())
+            physical_max = float(data[i].max())
+            
+            signals.append(edfio.EdfSignal(
+                data=data[i],
+                sampling_frequency=sampling_rate,
+                label=ch_name_short,
+                transducer_type="",
+                physical_dimension="uV",  # Microvolts for EEG
+                physical_range=(physical_min, physical_max),
+                digital_range=(-32768, 32767),  # Standard EDF digital range
+                prefiltering=""
+            ))
+        
+        # Create EDF file
+        edf_file = edfio.Edf(
+            signals=signals,
+            patient=edfio.Patient(
+                code=f"{self.record_id}",
+                sex="X",  # Unknown/not specified
+                birthdate=None,
+                name="Unknown"
+            ),
+            recording=edfio.Recording(
+                startdate=None,  # Will use current date
+                hospital_administration_code="IEEG",
+                investigator_technician_code="Unknown",
+                equipment_code="IEEG-Portal",
+                additional=[f"Day:{day_num}", f"C:{clip_metadata.get('num_clips', 1)}", f"D:{clip_metadata.get('total_duration_minutes', 1):.0f}m"]
+            )
+        )
+        
+        # Write the EDF file
+        edf_file.write(str(output_path))
+        
+        logger.info(f'Saved EDF file: {output_path}')
+
+    def _get_interictal_clips_edf(self, interictal_clips: pd.DataFrame, clip_path: Path):
+        """
+        Get the interictal clips and save them as combined EDF files for each day.
+        All clips for a day are combined into one continuous EDF file.
+        """
+        dataset = clip_path.name
+        interictal_clips = interictal_clips[interictal_clips['mark_for_extraction']]
+        
+        # Process each day separately
+        for day_num, day_clips in interictal_clips.groupby('day_num'):
+            logger.info(f'Processing day {day_num} in {dataset} of {self.record_id}')
+            
+            # Create directory for EDF files if it doesn't exist
+            edf_dir = clip_path / f'day{day_num}_edf'
+            edf_dir.mkdir(exist_ok=True)
+            
+            # Collect all clips for this day
+            all_clips_data = []
+            all_channel_labels = None
+            sampling_rate = None
+            total_duration_usec = 0
+            
+            # Process each clip and collect data
+            for clip_idx, (index, clip) in enumerate(day_clips.iterrows(), start=1):
+                start_time_usec = clip['start_time_usec']
+                end_time_usec = clip['end_time_usec']
+                
+                ieeg_clip, clip_sampling_rate, channel_labels = self.get_dataset_clips(
+                    dataset_name=dataset, 
+                    start_time_usec=start_time_usec, 
+                    end_time_usec=end_time_usec
+                )
+                
+                # Store metadata from first clip
+                if all_channel_labels is None:
+                    all_channel_labels = channel_labels
+                    sampling_rate = clip_sampling_rate
+                
+                # Convert DataFrame to numpy array and transpose (channels x samples)
+                clip_data = ieeg_clip.values.T
+                all_clips_data.append(clip_data)
+                
+                # Calculate total duration
+                total_duration_usec += (end_time_usec - start_time_usec)
+                
+                logger.info(f'Collected clip {clip_idx}/{len(day_clips)} for day {day_num}')
+            
+            # Combine all clips horizontally (concatenate along time axis)
+            combined_data = np.concatenate(all_clips_data, axis=1)
+            
+            # Prepare metadata for the combined file
+            first_clip = day_clips.iloc[0]
+            last_clip = day_clips.iloc[-1]
+            
+            combined_metadata = {
+                'timestamp': f"Day_{day_num}_combined",
+                'start_time_usec': first_clip['start_time_usec'],
+                'end_time_usec': last_clip['end_time_usec'],
+                'channels_labels': all_channel_labels,
+                'sampling_rate': sampling_rate,
+                'num_clips': len(day_clips),
+                'total_duration_minutes': total_duration_usec / (1e6 * 60)
+            }
+            
+            # Create output filename for combined file
+            output_filename = f'day{day_num}_combined.edf'
+            output_path = edf_dir / output_filename
+            
+            # Save combined data as EDF
+            self._save_as_edf(
+                ieeg_clip=pd.DataFrame(combined_data.T, columns=all_channel_labels),
+                sampling_rate=sampling_rate,
+                channel_labels=all_channel_labels,
+                output_path=output_path,
+                clip_metadata=combined_metadata,
+                day_num=day_num
+            )
+            
+            logger.info(f'Created combined EDF file: {output_path} with {len(day_clips)} clips ({combined_metadata["total_duration_minutes"]:.1f} minutes)')
+
 # %% 
 if __name__ == '__main__':
     
-    subjects_to_find = ['sub-RID0839',
-            'sub-RID0786',
-            'sub-RID0646',
-            'sub-RID0825','sub-RID0596']
+    # subjects_to_find = ['sub-RID0839',
+    #         'sub-RID0786',
+    #         'sub-RID0646',
+    #         'sub-RID0825','sub-RID0596']
+    
+    subjects_to_find = ['sub-RID0031']
     
     for subject in subjects_to_find:
         try:

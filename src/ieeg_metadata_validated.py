@@ -186,7 +186,7 @@ class IEEGmetadataValidated(IEEGmetadata, ManualValidation):
 # %%
 if __name__ == '__main__':
     
-    subjects_to_find = ["sub-RID0572"]
+    subjects_to_find = ["sub-RID0031"]
     
     ieeg = IEEGmetadataValidated()
     
